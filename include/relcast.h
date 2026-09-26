@@ -35,12 +35,6 @@ typedef enum {
     RC_PROTO_SHOUTCAST = 1
 } rc_output_proto_t;
 
-/* Input source type for a stream */
-typedef enum {
-    RC_INPUT_URL = 0,      /* remote Icecast/Shoutcast HTTP source */
-    RC_INPUT_PLAYLIST = 1  /* local text file listing media files, one per line */
-} rc_input_type_t;
-
 /* Codec choice for output encoding */
 typedef enum {
     RC_CODEC_MP3 = 0,
@@ -65,9 +59,6 @@ typedef struct {
 typedef struct {
     char name[64];          /* friendly identifier for logs */
 
-    /* Input selection */
-    rc_input_type_t input_type; /* RC_INPUT_URL or RC_INPUT_PLAYLIST */
-
     /* Input: RC_INPUT_URL */
     char input_url[1024];   /* http(s)://... source stream (Icecast/Shoutcast) */
     char input_user_agent[256];
@@ -83,9 +74,12 @@ typedef struct {
      * until it disconnects, at which point the playlist resumes from the
      * track it was on when interrupted. */
     int  live_enable;
-    int  live_listen_port;
+    int  live_listen_port_4;
+    int  live_listen_port_6;
     rc_live_credential_t live_credentials[RELCAST_MAX_LIVE_CREDENTIALS];
     int  live_credential_count;
+    char live_ip_addr_4[16]; //IPv4 address
+    char live_ip_addr_6[46]; //IPv6 address
 
     /* Output */
     char output_host[256];

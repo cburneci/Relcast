@@ -579,6 +579,7 @@ typedef struct {
 
     char *song_title;       /* HTML-encoded "now playing" metadata value */
     char *label;
+    rc_stream_t *st;
 } rc_track_src_t;
 
 
@@ -703,7 +704,7 @@ static void track_close(rc_track_src_t *t)
     free(t);
 }
 
-static rc_track_src_t *track_alloc_common(int target_rate, int target_ch)
+static rc_track_src_t *track_alloc_common(rc_stream_t *st, int target_rate, int target_ch)
 {
     rc_track_src_t *t = calloc(1, sizeof(*t));
     if (!t) return NULL;
@@ -721,6 +722,7 @@ static rc_track_src_t *track_alloc_common(int target_rate, int target_ch)
     t->swr = NULL;
     t->label = NULL;
     t->song_title = NULL; 
+    t->st = st;
     if (!t->dec_frame || !t->pkt || !t->fifo) {
         track_close(t);
         return NULL;
@@ -815,7 +817,7 @@ static char* basename_no_ext(const char *path)
 
 static rc_track_src_t *track_open_file(const char *path, int target_rate, int target_ch)
 {
-    rc_track_src_t *t = track_alloc_common(target_rate, target_ch);
+    rc_track_src_t *t = track_alloc_common(NULL, target_rate, target_ch);
     if (t == NULL) return NULL;
     if (path == NULL) return NULL;
     t->is_live = 0;
@@ -868,9 +870,9 @@ static rc_track_src_t *track_open_file(const char *path, int target_rate, int ta
 
 #define MAX_PROBE_SIZE 8192
 
-static rc_track_src_t *track_open_live(int fd, const char *user, int target_rate, int target_ch)
+static rc_track_src_t *track_open_live(rc_stream_t *st,  int fd, const char *user, int target_rate, int target_ch)
 {
-    rc_track_src_t *t = track_alloc_common(target_rate, target_ch);
+    rc_track_src_t *t = track_alloc_common(st, target_rate, target_ch);
     if (!t) return NULL;
     t->is_live = 1;
     t->fd = fd;
@@ -993,7 +995,9 @@ static int track_fill_more(rc_track_src_t *t)
         av_packet_unref(t->pkt);
         return 1; /* nothing decoded, but not EOF either; caller will retry */
     }
-
+    if (t->st != NULL) {
+        atomic_fetch_add(&t->st->bytes_in, t->pkt->size);
+    }
     ret = avcodec_send_packet(t->dec_ctx, t->pkt);
     av_packet_unref(t->pkt);
     if (ret < 0) {
@@ -1572,130 +1576,216 @@ static void *live_listener_main(void *arg)
 {
     rc_stream_t *st = (rc_stream_t *)arg;
     atomic_store(&st->live_thread_running, 1);
+    int listen_fd  = -1;
+    int listen_fd6 = -1;
 
-    int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (listen_fd < 0) {
-        rc_loge(st->cfg.name, "live listener: socket() failed: %s", strerror(errno));
-        atomic_store(&st->live_thread_running, 0);
-        return NULL;
-    }
-    int one = 1;
-    setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port = htons((uint16_t)st->cfg.live_listen_port);
-
-    if (bind(listen_fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
-        rc_loge(st->cfg.name, "live listener: bind() to port %d failed: %s",
-                st->cfg.live_listen_port, strerror(errno));
-        close(listen_fd);
-        atomic_store(&st->live_thread_running, 0);
-        return NULL;
-    }
-    if (listen(listen_fd, 4) != 0) {
-        rc_loge(st->cfg.name, "live listener: listen() failed: %s", strerror(errno));
-        close(listen_fd);
-        atomic_store(&st->live_thread_running, 0);
-        return NULL;
-    }
-
-    rc_logi(st->cfg.name, "live DJ listener ready on port %d (SHOUTcast v1)", st->cfg.live_listen_port);
-
-    while (!atomic_load(&st->stop_request)) {
-        struct pollfd pfd = { .fd = listen_fd, .events = POLLIN };
-        int pr = poll(&pfd, 1, 200);
-        if (pr <= 0) continue;
-
-        int cfd = accept(listen_fd, NULL, NULL);
-        
-        if (cfd < 0) {
-            rc_loge (st->cfg.name,"Could not accept connection: %s", strerror(errno));    
-            continue;
+    if (st->cfg.live_ip_addr_4[0] != '\0' && st->cfg.live_listen_port_4 != 0)
+    {
+        listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+        struct sockaddr_in addr;
+        if (listen_fd < 0) {
+            rc_loge(st->cfg.name, "live listener: socket() failed: %s", strerror(errno));
         }
-        struct timeval tv;
-        tv.tv_sec = 10;  // 10 seconds timeout
-        tv.tv_usec = 0;
-
-        // Apply the timeout specifically to this new client socket
-        if (setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv)) < 0) {
-           rc_loge (st->cfg.name,"Could not set timeout on socket: %s", strerror(errno));    
-           continue;
-        }
-
-        char line[512];
-        int n = read_line(cfd, line, sizeof(line));
-        if (n < 0) { close(cfd); continue; }
-
-        char user[64] = {0}, password[128] = {0};
-        char *colon = strchr(line, ':');
-        if (colon) {
-            size_t ulen = (size_t)(colon - line);
-            if (ulen >= sizeof(user)) ulen = sizeof(user) - 1;
-            memcpy(user, line, ulen);
-            user[ulen] = '\0';
-            snprintf(password, sizeof(password), "%.127s", colon + 1);
-        } else {
-            snprintf(password, sizeof(password), "%.127s", line);
-        }
-
-        rc_live_credential_t cred;
-        if (!find_matching_credential(&st->cfg, user, password, &cred)) {
-            rc_logw(st->cfg.name, "live listener: rejected connection (bad credentials, user='%s')", user);
-            send_all(cfd, "invalid password\r\n", 19);
-            close(cfd);
-            continue;
-        }
-
-        pthread_mutex_lock(&st->live_mutex);
-        if (st->live_connected) {
-            if (cred.priority > st->live_priority) {
-                rc_logw(st->cfg.name, "live listener: kicking user '%s' (prio %d) for higher-priority "
-                                       "user '%s' (prio %d)",
-                        st->live_user, st->live_priority, cred.user, cred.priority);
-                close(st->live_fd);
-                st->live_fd = cfd;
-                snprintf(st->live_user, sizeof(st->live_user), "%s", cred.user);
-                st->live_priority = cred.priority;
-                atomic_fetch_add(&st->live_generation, 1);
-                pthread_mutex_unlock(&st->live_mutex);
-            } else {
-                rc_logw(st->cfg.name, "live listener: denied user '%s' (prio %d): '%s' (prio %d) "
-                                       "already connected",
-                        cred.user, cred.priority, st->live_user, st->live_priority);
-                pthread_mutex_unlock(&st->live_mutex);
-                send_all(cfd, "invalid password\r\n", 19);
-                close(cfd);
-                continue;
+        if (listen_fd >= 0) {
+            int one = 1;
+            setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+            memset(&addr, 0, sizeof(addr));
+            addr.sin_family = AF_INET;
+             if (inet_pton(AF_INET, st->cfg.live_ip_addr_4, (void*)&(addr.sin_addr)) <= 0) {
+                rc_loge(st->cfg.name, "invalid IPv4 listen address %s", st->cfg.live_ip_addr_4);
+                close(listen_fd);
+                listen_fd = -1;
             }
+        }
+        if (listen_fd >= 0) {
+            addr.sin_port = htons((uint16_t)st->cfg.live_listen_port_4);
+
+            if (bind(listen_fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+                rc_loge(st->cfg.name, "live listener IPv4: bind() to port %d failed: %s",
+                        st->cfg.live_listen_port_4, strerror(errno));
+                close(listen_fd);
+                listen_fd = -1;
+            }
+        }
+        if (listen_fd >= 0) {
+            if (listen(listen_fd, 1) != 0) {
+                rc_loge(st->cfg.name, "live listener IPv4: listen() failed: %s", strerror(errno));
+                close(listen_fd);
+                listen_fd = -1;
+            }
+        }
+        if (listen_fd >= 0) {     
+            rc_logi(st->cfg.name, "live IPv4 DJ listener ready on port %d (SHOUTcast v1)", st->cfg.live_listen_port_4);
         } else {
-            st->live_connected = 1;
-            st->live_fd = cfd;
-            snprintf(st->live_user, sizeof(st->live_user), "%s", cred.user);
-            st->live_priority = cred.priority;
-            atomic_fetch_add(&st->live_generation, 1);
-            pthread_mutex_unlock(&st->live_mutex);
+            rc_loge(st->cfg.name, "NO live IPv4 DJ listener could be started (SHOUTcast v1)");
         }
-
-        send_all(cfd, "OK2\r\nicy-caps:11\r\n\r\n", 21);
-
-        /* Drain optional ICY header lines the client sends before raw audio. */
-        for (;;) {
-            char hline[512];
-            int hn = read_line(cfd, hline, sizeof(hline));
-            if (hn <= 0) break; /* blank line, disconnect, or error: audio starts (or already ended) */
-            rc_logd(st->cfg.name, "live listener: header from '%s': %s", cred.user, hline);
-        }
-
-        rc_logi(st->cfg.name, "live listener: user '%s' connected (priority %d)", cred.user, cred.priority);
-        /* The engine thread (run_playlist_stream) picks up st->live_connected
-         * and reads audio from st->live_fd from here on; this thread goes
-         * back to accepting further connection attempts (for kicks). */
     }
+    
+    if (st->cfg.live_ip_addr_6[0] != '\0' && st->cfg.live_listen_port_6 != 0)
+    {
+        listen_fd6 = socket(AF_INET6, SOCK_STREAM, 0);
+        struct sockaddr_in6 addr;
+        if (listen_fd6 < 0) {
+            rc_loge(st->cfg.name, "live listener: socket6() failed: %s", strerror(errno));
+        }
+        if (listen_fd6 >= 0) {
+            int one = 1;
+            setsockopt(listen_fd6, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+            int v6_only = 1;
+            setsockopt(listen_fd6, IPPROTO_IPV6, IPV6_V6ONLY, &v6_only, sizeof(v6_only));
+            
+           
+            memset(&addr, 0, sizeof(addr));
+            addr.sin6_family = AF_INET6;
+            if (inet_pton(AF_INET6, st->cfg.live_ip_addr_6, &addr.sin6_addr) <= 0) {
+                rc_loge(st->cfg.name, "invalid IPv6 listen address %s", st->cfg.live_ip_addr_6);
+                close(listen_fd6);
+                listen_fd6 = -1;
+            }
+        }
+        if (listen_fd6 >= 0) {
+            addr.sin6_port = htons((uint16_t)st->cfg.live_listen_port_6);
+            if (bind(listen_fd6, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+                rc_loge(st->cfg.name, "live listener IPv6: bind() to port %d failed: %s",
+                        st->cfg.live_listen_port_6, strerror(errno));
+                close(listen_fd6);
+                listen_fd6 = -1;
+            }
+        }
+        if (listen_fd6 >= 0) {
+            if (listen(listen_fd6, 1) != 0) {
+                rc_loge(st->cfg.name, "live listener IPv6: listen() failed: %s", strerror(errno));
+                close(listen_fd);
+                listen_fd6 = -1;
+            }
+        }
+         if (listen_fd6 >= 0) {
+            rc_logi(st->cfg.name, "live IPv6 DJ listener ready on port %d (SHOUTcast v1)", st->cfg.live_listen_port_6);
+        } else {
+            rc_loge(st->cfg.name, "NO live IPv6 DJ listener could be started (SHOUTcast v1)");
+        }
+    }
+    if (listen_fd == -1 && listen_fd6 == -1)
+    {
+        atomic_store(&st->live_thread_running, 0);
+        rc_loge(st->cfg.name, "Live DJ listener thread exiting (SHOUTcast v1)");
+        return NULL;
+    }
+    struct pollfd pfd[2]; /*{ .fd = listen_fd, .events = POLLIN }*/
+    pfd[0].fd = listen_fd;
+    pfd[0].events = POLLIN;
+    pfd[1].fd = listen_fd6;
+    pfd[1].events = POLLIN;
+    struct sockaddr_storage incoming;
+    socklen_t incoming_len;
+    char ip_text[INET6_ADDRSTRLEN];
+    while (!atomic_load(&st->stop_request)) {
+ 
+        int pr = poll(pfd, 2, 200);
+        if (pr <= 0) continue;
+        int i;
+        for (i = 0; i < 2 ;i++) {
+            if (pfd[i].revents & POLLIN) {   
+                int cfd = accept(pfd[i].fd, (struct sockaddr*)&incoming, &incoming_len);
+                if (incoming.ss_family == AF_INET) {
+                    // --- Cazul IPv4 ---
+                    struct sockaddr_in *addr_ipv4 = (struct sockaddr_in *)&incoming;
+                    inet_ntop(AF_INET, &(addr_ipv4->sin_addr), ip_text, sizeof(ip_text));
+                    //int port_client = ntohs(addr_ipv4->sin_port);
+                } else if (incoming.ss_family == AF_INET6) {
+                    // --- Cazul IPv6 ---
+                    struct sockaddr_in6 *addr_ipv6 = (struct sockaddr_in6 *)&incoming;
+                    inet_ntop(AF_INET6, &(addr_ipv6->sin6_addr), ip_text, sizeof(ip_text));
+                    //int port_client = ntohs(addr_ipv6->sin6_port);
+                }
+                if (cfd < 0) {
+                    rc_loge (st->cfg.name,"Could not accept connection from %s: %s",ip_text, strerror(errno));    
+                    continue;
+                } else {
+                    rc_logi (st->cfg.name,"Incoming connection from %s",ip_text);
+                }
+                struct timeval tv;
+                tv.tv_sec = 10;  // 10 seconds timeout
+                tv.tv_usec = 0;
 
-    close(listen_fd);
+                // Apply the timeout specifically to this new client socket
+                if (setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv)) < 0) {
+                   rc_loge (st->cfg.name,"Could not set timeout on socket: %s", strerror(errno));    
+                   continue;
+                }
+
+                char line[512];
+                int n = read_line(cfd, line, sizeof(line));
+                if (n < 0) { close(cfd); continue; }
+
+                char user[64] = {0}, password[128] = {0};
+                char *colon = strchr(line, ':');
+                if (colon) {
+                    size_t ulen = (size_t)(colon - line);
+                    if (ulen >= sizeof(user)) ulen = sizeof(user) - 1;
+                    memcpy(user, line, ulen);
+                    user[ulen] = '\0';
+                    snprintf(password, sizeof(password), "%.127s", colon + 1);
+                } else {
+                    snprintf(password, sizeof(password), "%.127s", line);
+                }
+
+                rc_live_credential_t cred;
+                if (!find_matching_credential(&st->cfg, user, password, &cred)) {
+                    rc_logw(st->cfg.name, "live listener: rejected connection (bad credentials, user='%s')", user);
+                    send_all(cfd, "invalid password\r\n", 19);
+                    close(cfd);
+                    continue;
+                }
+                pthread_mutex_lock(&st->live_mutex);
+                if (st->live_connected) {
+                    if (cred.priority > st->live_priority) {
+                        rc_logw(st->cfg.name, "live listener: kicking user '%s' (prio %d) for higher-priority "
+                                               "user '%s' (prio %d)",
+                                st->live_user, st->live_priority, cred.user, cred.priority);
+                        close(st->live_fd);
+                        st->live_fd = cfd;
+                        snprintf(st->live_user, sizeof(st->live_user), "%s", cred.user);
+                        st->live_priority = cred.priority;
+                        atomic_fetch_add(&st->live_generation, 1);
+                        pthread_mutex_unlock(&st->live_mutex);
+                    } else {
+                        rc_logw(st->cfg.name, "live listener: denied user '%s' (prio %d): '%s' (prio %d) "
+                                               "already connected",
+                                cred.user, cred.priority, st->live_user, st->live_priority);
+                        pthread_mutex_unlock(&st->live_mutex);
+                        send_all(cfd, "invalid password\r\n", 19);
+                        close(cfd);
+                        continue;
+                    }
+                } else {
+                    st->live_connected = 1;
+                    st->live_fd = cfd;
+                    snprintf(st->live_user, sizeof(st->live_user), "%s", cred.user);
+                    st->live_priority = cred.priority;
+                    atomic_fetch_add(&st->live_generation, 1);
+                    pthread_mutex_unlock(&st->live_mutex);
+                }
+
+                send_all(cfd, "OK2\r\nicy-caps:11\r\n\r\n", 21);
+
+                /* Drain optional ICY header lines the client sends before raw audio. */
+                for (;;) {
+                    char hline[512];
+                    int hn = read_line(cfd, hline, sizeof(hline));
+                    if (hn <= 0) break; /* blank line, disconnect, or error: audio starts (or already ended) */
+                    rc_logd(st->cfg.name, "live listener: header from '%s': %s", cred.user, hline);
+                }
+
+                rc_logi(st->cfg.name, "live listener: user '%s' connected (priority %d)", cred.user, cred.priority);
+                /* The engine thread (run_playlist_stream) picks up st->live_connected
+                 * and reads audio from st->live_fd from here on; this thread goes
+                 * back to accepting further connection attempts (for kicks). */
+            }
+        }
+    }
+    if (listen_fd != -1) close(listen_fd);
+    if (listen_fd6 != 1) close (listen_fd6);
     atomic_store(&st->live_thread_running, 0);
     return NULL;
 }
@@ -1766,114 +1856,198 @@ static void *metadata_listener_main(void *arg)
 {
     rc_stream_t *st = (rc_stream_t *)arg;
     atomic_store(&st->metadata_thread_running, 1);
+    int listen_fd  = -1;
+    int listen6_fd = -1;
+    char pass[256];
+    char song[512];
+    if (st->cfg.live_ip_addr_4[0] != '\0' && st->cfg.live_listen_port_4 != 0) {
+        int admin_port = st->cfg.live_listen_port_4 - 1;
 
-    int admin_port = st->cfg.live_listen_port - 1;
-
-    int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (listen_fd < 0) {
-        rc_loge(st->cfg.name, "metadata listener: socket() failed: %s", strerror(errno));
-        atomic_store(&st->metadata_thread_running, 0);
-        return NULL;
+        listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+        struct sockaddr_in addr;
+        if (listen_fd < 0) {
+            rc_loge(st->cfg.name, "metadata listener: socket() failed: %s", strerror(errno));
+            //atomic_store(&st->metadata_thread_running, 0);
+            //return NULL;
+        }
+        if (listen_fd >= 0) {
+            int one = 1;
+            setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+            memset(&addr, 0, sizeof(addr));
+            addr.sin_family = AF_INET;
+            if (inet_pton(AF_INET, st->cfg.live_ip_addr_4, (void*)&(addr.sin_addr)) <= 0) {
+                rc_loge(st->cfg.name, "invalid IPv4 listen address %s", st->cfg.live_ip_addr_4);
+                //atomic_store(&st->live_thread_running, 0);
+                close(listen_fd);
+                listen_fd = -1;
+            }
+        }
+        if (listen_fd >= 0) {
+            addr.sin_port = htons((uint16_t)admin_port);
+            if (bind(listen_fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+                rc_loge(st->cfg.name, "metadata listener: IPv4 bind() to port %d failed: %s",
+                        admin_port, strerror(errno));
+                close(listen_fd);
+                listen_fd = -1;
+            }
+        }
+        if (listen_fd >= 0) {
+            if (listen(listen_fd, 4) != 0) {
+                rc_loge(st->cfg.name, "metadata listener: IPv4 listen() failed: %s", strerror(errno));
+                close(listen_fd);
+                listen_fd = -1;
+            }
+        }
+        if (listen_fd >= 0) {
+            rc_logi(st->cfg.name, "DJ metadata listener ready on port %d (admin.cgi)", admin_port);
+        }
     }
-    int one = 1;
-    setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    if (st->cfg.live_ip_addr_6[0] != '\0' && st->cfg.live_listen_port_6 != 0) {
+        int admin_port = st->cfg.live_listen_port_6 - 1;
 
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port = htons((uint16_t)admin_port);
-
-    if (bind(listen_fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
-        rc_loge(st->cfg.name, "metadata listener: bind() to port %d failed: %s",
-                admin_port, strerror(errno));
-        close(listen_fd);
-        atomic_store(&st->metadata_thread_running, 0);
-        return NULL;
+        listen6_fd = socket(AF_INET6, SOCK_STREAM, 0);
+        struct sockaddr_in6 addr;
+        if (listen6_fd < 0) {
+            rc_loge(st->cfg.name, "metadata listener: socket() failed: %s", strerror(errno));
+        }
+        if (listen6_fd >= 0) {
+            int one = 1;
+            setsockopt(listen6_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+            int v6_only = 1;
+            setsockopt(listen6_fd, IPPROTO_IPV6, IPV6_V6ONLY, &v6_only, sizeof(v6_only));
+            memset(&addr, 0, sizeof(addr));
+            addr.sin6_family = AF_INET6;
+            if (inet_pton(AF_INET6, st->cfg.live_ip_addr_6, (void*)&(addr.sin6_addr)) <= 0) {
+                rc_loge(st->cfg.name, "invalid IPv6 listen address %s", st->cfg.live_ip_addr_4);
+                close(listen6_fd);
+                listen6_fd = -1;
+            } 
+        }
+        if (listen6_fd >= 0) {
+             int one = 1;
+            setsockopt(listen6_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+            int v6_only = 1;
+            setsockopt(listen6_fd, IPPROTO_IPV6, IPV6_V6ONLY, &v6_only, sizeof(v6_only));
+            memset(&addr, 0, sizeof(addr));
+            addr.sin6_family = AF_INET6;
+            if (inet_pton(AF_INET6, st->cfg.live_ip_addr_6, (void*)&(addr.sin6_addr)) <= 0) {
+                rc_loge(st->cfg.name, "invalid IPv6 listen address %s", st->cfg.live_ip_addr_4);
+                close(listen6_fd);
+                listen6_fd = -1;
+            }
+        }
+        if (listen6_fd >= 0) {
+            addr.sin6_port = htons((uint16_t)admin_port);
+            if (bind(listen6_fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+                rc_loge(st->cfg.name, "metadata listener: IPv6 bind() to port %d failed: %s",
+                        admin_port, strerror(errno));
+                close(listen6_fd);
+                listen6_fd = -1;
+            }
+        }
+        if (listen6_fd >= 0) {
+            if (listen(listen6_fd, 4) != 0) {
+                rc_loge(st->cfg.name, "metadata listener: IPv6 listen() failed: %s", strerror(errno));
+                close(listen6_fd);
+                listen6_fd = -1;
+            }
+        }
+        if (listen6_fd >= 0) {
+             rc_logi(st->cfg.name, "DJ IPv6 metadata listener ready on port %d (admin.cgi)", admin_port);
+        } else {
+             rc_loge(st->cfg.name, "NO live IPv6 metadata listener could be started (SHOUTcast v1)");
+        }
     }
-    if (listen(listen_fd, 4) != 0) {
-        rc_loge(st->cfg.name, "metadata listener: listen() failed: %s", strerror(errno));
-        close(listen_fd);
-        atomic_store(&st->metadata_thread_running, 0);
-        return NULL;
-    }
-
-    rc_logi(st->cfg.name, "DJ metadata listener ready on port %d (admin.cgi)", admin_port);
-
+    if (listen_fd < 0 && listen6_fd < 0)
+    {
+         atomic_store(&st->metadata_thread_running, 0);
+         rc_loge(st->cfg.name, "Live metadata listener thread exiting (SHOUTcast v1)");
+         return NULL;
+    }    
+    struct pollfd pfd[2];
+    pfd[0].fd = listen_fd;
+    pfd[0].events = POLLIN;
+    pfd[1].fd = listen6_fd;
+    pfd[1].events = POLLIN;
+  
     while (!atomic_load(&st->stop_request)) {
-        struct pollfd pfd = { .fd = listen_fd, .events = POLLIN };
-        int pr = poll(&pfd, 1, 200);
+        int pr = poll(pfd, 2, 200);
         if (pr <= 0) continue;
+        int i;
+        for (i = 0; i < 2 ;i++) {
+            if (pfd[i].revents & POLLIN) {   
+                int cfd = accept(pfd[i].fd, NULL, NULL);        
+                if (cfd < 0) {
+                    rc_loge (st->cfg.name,"Could not accept metadata connection" );    
+                    continue;
+                } else {
+                    rc_logi (st->cfg.name,"Incoming metadata");
+                }
+                char line[MAX_HTTP_GET_LEN + 1];
+                int n = read_line(cfd, line, sizeof(line));
+                if (n < 0) { close(cfd); continue; }
 
-        int cfd = accept(listen_fd, NULL, NULL);
-        if (cfd < 0) continue;
+                /* Expect: GET /admin.cgi?...  HTTP/1.x */
+                char method[MAX_HTTP_METHOD_LEN + 1] = {0}, path[MAX_HTTP_GET_LEN + 1] = {0};
+                if (sscanf(line, "%" STR(MAX_HTTP_METHOD_LEN) "s %" STR(MAX_HTTP_GET_LEN) "s", method, path) != 2 || strcmp(method, "GET") != 0) {
+                    send_all(cfd, "HTTP/1.0 400 Bad Request\r\n\r\n", 29);
+                    close(cfd);
+                    continue;
+                    }
+                /* Drain remaining request headers (until blank line); we don't need
+                 * them but must consume them to be a well-behaved HTTP peer. */
+                for (;;) {
+                    char hline[512];
+                    int hn = read_line(cfd, hline, sizeof(hline));
+                    if (hn <= 0) break;
+                }
 
-        char line[MAX_HTTP_GET_LEN + 1];
-        int n = read_line(cfd, line, sizeof(line));
-        if (n < 0) { close(cfd); continue; }
+                char *query = strchr(path, '?');
+                query = query ? query + 1 : "";
 
-        /* Expect: GET /admin.cgi?...  HTTP/1.x */
-        char method[MAX_HTTP_METHOD_LEN + 1] = {0}, path[MAX_HTTP_GET_LEN + 1] = {0};
-        if (sscanf(line, "%" STR(MAX_HTTP_METHOD_LEN) "s %" STR(MAX_HTTP_GET_LEN) "s", method, path) != 2 || strcmp(method, "GET") != 0) {
-            send_all(cfd, "HTTP/1.0 400 Bad Request\r\n\r\n", 29);
-            close(cfd);
-            continue;
+                char pass_raw[256] = {0}, song_raw[512] = {0};
+                qs_get(query, "pass", pass_raw, sizeof(pass_raw));
+                qs_get(query, "song", song_raw, sizeof(song_raw));
+
+                percent_decode(pass_raw, pass, sizeof(pass));
+                percent_decode(song_raw, song, sizeof(song));
+
+                int authed = 0;
+                for (int i = 0; i < st->cfg.live_credential_count; i++) {
+                       int streampasswdlen = strlen(st->cfg.live_credentials[i].user) + strlen(st->cfg.live_credentials[i].password) + 1; //":"
+                       char *streampasswd = malloc(streampasswdlen + 1); //null terminated
+                       if (!streampasswd) { rc_loge(st->cfg.name, "metadata listener: out of memory"); break;}
+                       snprintf(streampasswd,streampasswdlen + 1,"%s:%s",st->cfg.live_credentials[i].user, st->cfg.live_credentials[i].password);
+                       if (strcmp(streampasswd, pass) == 0) { authed = 1; }
+                       free(streampasswd);
+                       if (authed) { break;}
+                    }
+
+                if (!authed) {
+                    rc_logw(st->cfg.name, "metadata listener: rejected admin.cgi request (bad pass)");
+                    send_all(cfd, "HTTP/1.0 401 Unauthorized\r\n\r\n", 30);
+                    close(cfd);
+                    continue;
+                }
+
+                send_all(cfd, "HTTP/1.0 200 OK\r\nContent-Type: text/html\r\n\r\n<html><body>OK</body></html>", 76);
+                close(cfd);
+                rc_logi(st->cfg.name, "metadata listener: received song update: %s", song);
+                            //skip html encode for now
+                //char song_html[256];
+                //html_encode(song, song_html, sizeof(song_html));
+                
+                // Is this really needed?
+                //pthread_mutex_lock(&st->metadata_mutex);
+                //snprintf(st->live_song_title, sizeof(st->live_song_title), "%s", song);
+                //pthread_mutex_unlock(&st->metadata_mutex);
+
+                send_song_metadata_update(st, song);
+            }
         }
-
-        /* Drain remaining request headers (until blank line); we don't need
-         * them but must consume them to be a well-behaved HTTP peer. */
-        for (;;) {
-            char hline[512];
-            int hn = read_line(cfd, hline, sizeof(hline));
-            if (hn <= 0) break;
-        }
-
-        char *query = strchr(path, '?');
-        query = query ? query + 1 : "";
-
-        char pass_raw[256] = {0}, song_raw[512] = {0};
-        qs_get(query, "pass", pass_raw, sizeof(pass_raw));
-        qs_get(query, "song", song_raw, sizeof(song_raw));
-
-        char pass[256]; percent_decode(pass_raw, pass, sizeof(pass));
-        char song[512]; percent_decode(song_raw, song, sizeof(song));
-
-        int authed = 0;
-        for (int i = 0; i < st->cfg.live_credential_count; i++) {
-           int streampasswdlen = strlen(st->cfg.live_credentials[i].user) + strlen(st->cfg.live_credentials[i].password) + 1; //":"
-           char *streampasswd = malloc(streampasswdlen + 1); //null terminated
-           if (!streampasswd) { rc_loge(st->cfg.name, "metadata listener: out of memory"); break;}
-           snprintf(streampasswd,streampasswdlen + 1,"%s:%s",st->cfg.live_credentials[i].user, st->cfg.live_credentials[i].password);
-           if (strcmp(streampasswd, pass) == 0) { authed = 1; }
-           free(streampasswd);
-           if (authed) { break;}
-        }
-
-        if (!authed) {
-            rc_logw(st->cfg.name, "metadata listener: rejected admin.cgi request (bad pass)");
-            send_all(cfd, "HTTP/1.0 401 Unauthorized\r\n\r\n", 30);
-            close(cfd);
-            continue;
-        }
-
-        send_all(cfd, "HTTP/1.0 200 OK\r\nContent-Type: text/html\r\n\r\n<html><body>OK</body></html>", 76);
-        close(cfd);
-
-        rc_logi(st->cfg.name, "metadata listener: received song update: %s", song);
-
-        //skip html encode for now
-        //char song_html[256];
-        //html_encode(song, song_html, sizeof(song_html));
-        
-        // Is this really needed?
-        //pthread_mutex_lock(&st->metadata_mutex);
-        //snprintf(st->live_song_title, sizeof(st->live_song_title), "%s", song);
-        //pthread_mutex_unlock(&st->metadata_mutex);
-
-        send_song_metadata_update(st, song);
     }
-
-    close(listen_fd);
+    if (listen_fd  > 0) close(listen_fd );
+    if (listen6_fd > 0) close(listen6_fd);
     atomic_store(&st->metadata_thread_running, 0);
     return NULL;
 }
@@ -2014,7 +2188,7 @@ static void run_playlist_stream(rc_stream_t *st)
 
         if (live_now && !cur->is_live && !in_transition) {
             /* DJ connected: crossfade from playlist track into live audio. */
-            rc_track_src_t *live_t = track_open_live(live_fd_now, live_user_now, target_rate, target_ch);
+            rc_track_src_t *live_t = track_open_live(st, live_fd_now, live_user_now, target_rate, target_ch);
             if (live_t) {
                 rc_logi(st->cfg.name, "live source connected ('%s'), fading in", live_user_now);
                 paused_playlist = cur; /* keep old playlist track open, paused */
@@ -2049,7 +2223,7 @@ static void run_playlist_stream(rc_stream_t *st)
             /* Kicked and replaced by a different live user: hard-swap the fd
              * onto the same logical "live" slot without a crossfade (the old
              * socket is already closed by the listener thread). */
-            rc_track_src_t *live_t = track_open_live(live_fd_now, live_user_now, target_rate, target_ch);
+            rc_track_src_t *live_t = track_open_live(st, live_fd_now, live_user_now, target_rate, target_ch);
             if (live_t) {
                 rc_logi(st->cfg.name, "live source replaced by higher-priority user '%s'", live_user_now);
                 track_close(cur);

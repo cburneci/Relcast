@@ -17,6 +17,9 @@
 #include <strings.h>
 #include <getopt.h>
 #include <ctype.h>
+#include <arpa/inet.h> 
+#include <sys/socket.h>
+#include <netinet/in.h>
 
 void rc_config_set_defaults(rc_stream_config_t *sc)
 {
@@ -26,7 +29,10 @@ void rc_config_set_defaults(rc_stream_config_t *sc)
  
     sc->crossfade_ms = RELCAST_DEFAULT_CROSSFADE_MS;
     sc->live_enable = 0;
-    sc->live_listen_port = 0;
+    sc->live_listen_port_4 = 0;
+    sc->live_listen_port_6 = 0;
+    sc->live_ip_addr_4[0] = '\0';
+    sc->live_ip_addr_6[0] = '\0';
     sc->live_credential_count = 0;
     sc->output_port = 8000;
     snprintf(sc->output_mount, sizeof(sc->output_mount), "/stream");
@@ -194,7 +200,7 @@ int rc_config_parse_args(int argc, char **argv, rc_app_config_t *cfg)
  *
  * playlist_file = /etc/relcast/radio1.m3u
  * crossfade_ms = 3000
- *
+ *#include <arpa/inet.h> 
  * # optional live DJ-override listener 
  * live_enable = 1
  * live_listen_port = 8010
@@ -243,6 +249,21 @@ static int parse_live_credential(const char *val, rc_live_credential_t *out)
     return RC_OK;
 }
 
+static int parse_ip4_addr (const char *ip_str, struct in_addr *dst4 ) {
+
+    if (inet_pton(AF_INET, ip_str, dst4) == 1) {
+        return RC_OK;
+    }
+    return RC_ERROR;
+}
+
+static int parse_ip6_addr (const char *ip_str, struct in6_addr *dst6 ) {
+    if (inet_pton(AF_INET6, ip_str, dst6) == 1) {
+        return RC_OK;
+    }
+    return RC_ERROR;
+}
+        
 static int finalize_stream(rc_app_config_t *cfg, rc_stream_config_t *sc, const char *path)
 {
     /* Basic sanity checks for the just-parsed stream. */
@@ -252,17 +273,22 @@ static int finalize_stream(rc_app_config_t *cfg, rc_stream_config_t *sc, const c
         return RC_ERROR;
     }
    
-     if (sc->live_enable && sc->live_listen_port <= 0) {
-        fprintf(stderr, "config error in '%s': stream '%s' has live_enable=1 but no "
+     if (sc->live_enable && sc->live_ip_addr_4[0] != '\0' && sc->live_listen_port_4 <= 0) {
+        fprintf(stderr, "config error in '%s': stream '%s' has live_enable=1, the IPv4 listen addr defined,  but no "
                          "live_listen_port set\n", path, sc->name);
         return RC_ERROR;
     }
-
+    if (sc->live_enable && sc->live_ip_addr_6[0] != '\0' && sc->live_listen_port_6 <= 0) {
+        fprintf(stderr, "config error in '%s': stream '%s' has live_enable=1, the IPv6 listen addr defined,  but no "
+                         "live_listen_port set\n", path, sc->name);
+        return RC_ERROR;
+    }
     if (cfg->stream_count >= RELCAST_MAX_STREAMS) {
         fprintf(stderr, "too many streams in config file '%s'\n", path);
         return RC_ERROR;
     }
     cfg->streams[cfg->stream_count++] = *sc;
+    
     return 0;
 }
 
@@ -331,8 +357,10 @@ int rc_config_load_file(const char *path, rc_app_config_t *cfg)
                sc.crossfade_ms = atoi(val);
            else if (strcasecmp(key, "live_enable") == 0)
                sc.live_enable = atoi(val);
-           else if (strcasecmp(key, "live_listen_port") == 0)
-               sc.live_listen_port = atoi(val);
+           else if (strcasecmp(key, "live_ipv4_listen_port") == 0)
+               sc.live_listen_port_4 = atoi(val);
+           else if (strcasecmp(key, "live_ipv6_listen_port") == 0)
+               sc.live_listen_port_6 = atoi(val);    
            else if (strcasecmp(key, "live_credential") == 0) {
                if (sc.live_credential_count >= RELCAST_MAX_LIVE_CREDENTIALS) {
                    fprintf(stderr, "warning: too many live_credential entries for stream '%s', "
@@ -347,6 +375,21 @@ int rc_config_load_file(const char *path, rc_app_config_t *cfg)
                    }
                }
            }
+           else if (strcasecmp(key, "live_ipv4_listen_addr") == 0) {    
+                 struct in_addr dst4;
+                 if (parse_ip4_addr(val, &dst4)) {
+                     fprintf(stderr, "warning: malformed IPv4 address '%s' for stream '%s' ignored\n", val, sc.name);
+                 } else {
+                     snprintf(sc.live_ip_addr_4, 16, "%s", val);
+                 }    
+           } else if (strcasecmp(key, "live_ipv6_listen_addr") == 0) {    
+                 struct in6_addr dst6;
+                 if (parse_ip6_addr(val, &dst6)) {
+                     fprintf(stderr, "warning: malformed IPv6  address '%s' for stream '%s' ignored\n", val, sc.name);
+                 } else {
+                     snprintf(sc.live_ip_addr_6, 46, "%s", val);
+                 }
+           }    
            else if (strcasecmp(key, "output_host") == 0)
                snprintf(sc.output_host, sizeof(sc.output_host), "%s", val);
            else if (strcasecmp(key, "output_port") == 0)
