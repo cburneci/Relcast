@@ -93,7 +93,7 @@ The next example script lists all the mp3 files in a folder
 #!/bin/sh
 indirectory=$1
 find "$indirectory"   -name "*mp3" -type f
-'''
+```
 
 ## Command-Line Reference
 
