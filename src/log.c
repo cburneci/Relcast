@@ -13,7 +13,7 @@
 #include <time.h>
 #include <pthread.h>
 
-static int g_log_level = RC_LOG_INFO;
+static int g_log_level = RC_LOG_ERROR;
 static pthread_mutex_t g_log_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 void rc_log_set_level(int level)

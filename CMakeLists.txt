@@ -20,7 +20,7 @@ project(relcast)
 # This setting is useful for providing JSON file used by CodeLite for code completion
 set(CMAKE_EXPORT_COMPILE_COMMANDS 1)
 
-set(CONFIGURATION_NAME "Debug")
+set(CONFIGURATION_NAME "Release")
 
 set(CL_WORKSPACE_DIRECTORY .)
 # Set default locations
@@ -71,15 +71,17 @@ find_package(Threads REQUIRED)
 include_directories(
     .
     .
-    ./include
 
 )
 
 
 # Compiler options
-add_definitions(-gdwarf-2)
-add_definitions(-O0)
+add_definitions(-O2)
 add_definitions(-Wall)
+add_definitions(
+    -DNDEBUG
+)
+
 
 # Linker options
 
@@ -103,7 +105,7 @@ set ( C_SRCS
 
 set_source_files_properties(
     ${C_SRCS} PROPERTIES COMPILE_FLAGS 
-    " -gdwarf-2 -O0 -Wall")
+    " -O2 -Wall")
 
 if(WIN32)
     enable_language(RC)

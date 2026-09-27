@@ -37,7 +37,7 @@ void rc_config_set_defaults(rc_stream_config_t *sc)
     sc->output_port = 8000;
     snprintf(sc->output_mount, sizeof(sc->output_mount), "/stream");
     snprintf(sc->output_user, sizeof(sc->output_user), "source");
-    sc->output_proto = RC_PROTO_ICECAST;
+    sc->output_proto = RC_PROTO_SHOUTCAST;
     sc->output_tls = 0;
     sc->codec = RC_CODEC_MP3;
     sc->bitrate = 128000;

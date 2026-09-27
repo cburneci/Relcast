@@ -664,7 +664,7 @@ static int live_read_packet(void *opaque, uint8_t *buf, int buf_size)
 static void track_close(rc_track_src_t *t)
 {
     if (!t) return;
-    rc_logi ("DEBUG","closing track");
+    rc_logi (t->st->cfg.name,"closing track");
    
 
     if (t->ifmt_ctx) {
@@ -904,20 +904,20 @@ static rc_track_src_t *track_open_live(rc_stream_t *st,  int fd, const char *use
     //using av_probe_input_buffer2 to find out the stream type
    int ret = av_probe_input_buffer2(t->avio, &fmt, NULL, NULL, 0, MAX_PROBE_SIZE);  
    if (ret >= 0 && fmt != NULL) {
-      rc_logi ("DEBUG","Detected stream format: %s (%s)", fmt->name, fmt->long_name);
+      rc_logi (st->cfg.name,"Detected stream format: %s (%s)", fmt->name, fmt->long_name);
       if (strncmp(fmt->name,"mp3",strlen("mp3")) == 0) {
          t->codec_type = 1;
       } else if (strncmp(fmt->name,"aac",strlen("aac")) == 0) {
          t->codec_type = 2;
       } else {
          t->codec_type = 0; //other format
-         rc_loge ("DEBUG","Unsupported format. Closing track");
+         rc_loge (st->cfg.name,"Unsupported format. Closing track");
          track_close(t); 
          return NULL; 
       }
       // Rezultatul va fi "mp3" sau "aac" (care acoperă AAC/AAC+)
    } else {
-      rc_loge("DEBUG", "Could not detect the stream format: assuming mp3");
+      rc_loge(st->cfg.name, "Could not detect the stream format: assuming mp3");
       fmt = av_find_input_format("mp3");
       t->codec_type = 1;
    }
@@ -1417,7 +1417,7 @@ static int playlist_load(rc_stream_t *st)
     
     if (st->cfg.random_order == 1){ 
       idx_shuffle(&idx_arr, cnt);
-      rc_logi("DEBUG" , "The list is shuffled");
+      rc_logi(st->cfg.name , "The list is shuffled");
     }
    
     pthread_mutex_lock(&st->playlist_mutex);
@@ -2099,9 +2099,12 @@ static void run_playlist_stream(rc_stream_t *st)
     int out_delay_ms = st->cfg.reconnect_delay_ms > 0 ? st->cfg.reconnect_delay_ms : RELCAST_DEFAULT_RECONNECT_DELAY_MS;
     int out_max_delay_ms = st->cfg.max_reconnect_delay_ms > 0 ? st->cfg.max_reconnect_delay_ms : RELCAST_MAX_RECONNECT_DELAY_MS;
 
-    rc_track_src_t *cur = NULL;
-    rc_track_src_t *nxt = NULL;
+    rc_track_src_t *cur = NULL; //current song
+    rc_track_src_t *nxt = NULL; //next song
     rc_track_src_t *paused_playlist = NULL; /* stashed playlist track while live is active */
+    rc_track_src_t *trackA = NULL; //crossfader sources
+    rc_track_src_t *trackB = NULL;
+    
     int in_transition = 0;
     int64_t transition_pos = 0;
     int cur_generation = 0; /* live_generation captured when cur became the live track */
@@ -2151,7 +2154,7 @@ static void run_playlist_stream(rc_stream_t *st)
               // Durata este stocată în microsecunde. O convertim în secunde.
               int64_t duration_micros = cur->ifmt_ctx->duration;
               double duration_seconds = (double)duration_micros / AV_TIME_BASE;
-              rc_logi ("DEBUG", "Durata clipului %f", duration_seconds);
+              rc_logi (st->cfg.name, "song duration %f", duration_seconds);
               if (duration_seconds < (double)MIN_DURATION_TO_CROSSFADE) {
                   this_will_fade = 0;
               } else {
@@ -2193,11 +2196,9 @@ static void run_playlist_stream(rc_stream_t *st)
                 rc_logi(st->cfg.name, "live source connected ('%s'), fading in", live_user_now);
                 paused_playlist = cur; /* keep old playlist track open, paused */
                 nxt = live_t;
-                cur_generation = live_gen_now;
-                in_transition = 1;
-                //BUG The DJ stream will fade
                 next_will_fade = 1;
-                transition_pos = 0;
+                cur_generation = live_gen_now;
+                in_transition = 1; transition_pos = 0; trackA = cur; trackB = nxt;
             } else {
                live_now = 0;
                rc_logi(st->cfg.name, "live source tried to connect ('%s') but failed during the process", live_user_now);
@@ -2217,8 +2218,7 @@ static void run_playlist_stream(rc_stream_t *st)
                 nxt = acquire_next_playlist_track(st, target_rate, target_ch);
                 if (!nxt) break;
             }
-            in_transition = 1;
-            transition_pos = 0;
+            in_transition = 1; transition_pos = 0; trackA = cur; trackB = nxt;
         } else if (live_now && cur->is_live && cur_generation != live_gen_now && !in_transition) {
             /* Kicked and replaced by a different live user: hard-swap the fd
              * onto the same logical "live" slot without a crossfade (the old
@@ -2246,18 +2246,20 @@ static void run_playlist_stream(rc_stream_t *st)
               // Durata este stocată în microsecunde. O convertim în secunde.
               int64_t duration_micros = t->ifmt_ctx->duration;
               double duration_seconds = (double)duration_micros / AV_TIME_BASE;
-              rc_logi ("DEBUG", "Durata clipului %f", duration_seconds);
+              rc_logd (st->cfg.name, "song duration %f", duration_seconds);
               if (duration_seconds >= (double)MIN_DURATION_TO_CROSSFADE)
               {
                    next_will_fade = 1;
               }  
             }
-           
-            in_transition = 1; transition_pos = 0; 
             nxt = t;
+            rc_logi(st->cfg.name, "crossfading into: %s", nxt->label);
+            in_transition = 1; transition_pos = 0; trackA = cur; trackB = nxt;
+            
             if (this_will_fade == 1 && next_will_fade == 0) {
                   crossfade_samples = target_rate; // 1 s;
             }
+            
         }
         /* --- Natural lookahead crossfade: start fading into the next track
          * before the current one physically ends, when we know its total
@@ -2274,7 +2276,7 @@ static void run_playlist_stream(rc_stream_t *st)
                         // Durata este stocată în microsecunde. O convertim în secunde.
                         int64_t duration_micros = nxt->ifmt_ctx->duration;
                         double duration_seconds = (double)duration_micros / AV_TIME_BASE;
-                        rc_logi ("DEBUG", "Durata clipului %f", duration_seconds);
+                        rc_logd (st->cfg.name, "song duration %f", duration_seconds);
                         if (duration_seconds > (double)MIN_DURATION_TO_CROSSFADE) { 
                            next_will_fade = 1;
                         }
@@ -2284,8 +2286,8 @@ static void run_playlist_stream(rc_stream_t *st)
                      } 
                      if (this_will_fade == 1) {
                         rc_logi(st->cfg.name, "crossfading into: %s", nxt->label);
-                        in_transition = 1;
-                        transition_pos = 0;
+                        in_transition = 1; transition_pos = 0; trackA = cur, trackB = nxt;
+                        
                      }
                   } else {
                     break;
@@ -2298,8 +2300,10 @@ static void run_playlist_stream(rc_stream_t *st)
         if (in_transition) {
             //rc_logi("DEBUG", "Transition: current will fade = %d next will fade = %d, cross samples = %ld", this_will_fade, next_will_fade, crossfade_samples);
             int n, n_old, n_new;
-            n_old = cur ? track_get_samples(cur, bufA, MIX_CHUNK_SAMPLES) : 0;
-            n_new = nxt ? track_get_samples(nxt, bufB, MIX_CHUNK_SAMPLES) : 0;
+            n_old = trackA ? track_get_samples(trackA, bufA, MIX_CHUNK_SAMPLES) : 0;
+            if (n_old == 0 && trackA != NULL) { track_close(trackA); trackA = NULL; }
+            n_new = trackB ? track_get_samples(trackB, bufB, MIX_CHUNK_SAMPLES) : 0;
+            if (n_new == 0 && trackB != NULL) { track_close(trackB); trackB = NULL; }
             n = n_old > n_new ? n_old : n_new;
             if (n > 0) {
                float g_out, g_in;
@@ -2317,9 +2321,8 @@ static void run_playlist_stream(rc_stream_t *st)
                }
                if (transition_pos >= crossfade_samples || (n_old == 0 && n_new == 0)) {
                    /* Transition complete (or old source ran out early). */
-                   if (cur && cur != paused_playlist) track_close(cur);
-                   
-                   cur = nxt;
+                   if (trackA && trackA != paused_playlist) track_close(trackA);
+                   cur = trackB; //can be NULL, next track will be selected
                    nxt = NULL;
                    in_transition = 0;
                    transition_pos = 0;
