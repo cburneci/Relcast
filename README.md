@@ -1,6 +1,8 @@
 # Relcast
 
 A lightweight command-line **Icecast/Shoutcast player and transcoder**, built on top of FFmpeg's `libav*` libraries. It behaves similarly to the now-abandoned `sc_trans` program.
+The code is in a very alpha stage, it may lack features, and may behave erraticaly sometimes,  but I am successfully using it to stream music to a Shoutcast server.
+Playlists are simple text files with one full path of a song file per row, just the way sc_trans was using.
 
 ## Table of Contents
 
@@ -29,10 +31,13 @@ A lightweight command-line **Icecast/Shoutcast player and transcoder**, built on
 
 ## Warnings
 
+- The code is in a very alpha stage! Use it at your own risk!
 - The program is theoretically capable of supporting multiple stream definitions (see [Config File Format](#config-file-format) below); however, this functionality has not yet been tested.
 
 ## Limitations
 
+- Linux-only. I have, yet, no intention to port it.
+- The metadata in the media files is not used. Instead, the program uses the filename without the extension as metadata.
 - Shoutcast sources and servers support only MP3 and AAC as output formats. Consequently, listeners will only be able to decode MP3 and AAC streams.
 
 ## Requirements
@@ -81,6 +86,14 @@ To increase log verbosity (repeatable) or silence everything but errors:
 ./relcast -c /etc/relcast/streams.ini -v -v     # Debug-level logs
 ./relcast -c /etc/relcast/streams.ini -q        # Errors only
 ```
+Playlists are simple text files with one full path of a song file per row, just the way sc_trans was using.
+The next example script lists all the mp3 files in a folder
+
+```sh
+#!/bin/sh
+indirectory=$1
+find "$indirectory"   -name "*mp3" -type f
+'''
 
 ## Command-Line Reference
 
@@ -122,7 +135,7 @@ live_enable = 1
 live_ipv4_listen_addr = 0.0.0.0
 live_ipv4_listen_port = 8001
 live_ipv6_listen_addr = ::
-live_ipv6_listen_port = 8010
+live_ipv6_listen_port = 8011
 live_credential = alice:secret1:10
 live_credential = bob:secret2:5
 ```
@@ -150,5 +163,4 @@ kill -HUP "$(cat /tmp/relcast.pid)"      # Live config reload
 
 kill -WINCH "$(cat /tmp/relcast.pid)"    # Skip current playlist track
 kill -USR1 "$(cat /tmp/relcast.pid)"     # Reload playlist file(s) from disk
->>>>>>> 8a383ae (Several minor fixes)
 ```
