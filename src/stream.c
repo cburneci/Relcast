@@ -1125,15 +1125,17 @@ static rc_out_t *out_open(rc_stream_t *st, int target_rate, int target_ch)
     av_channel_layout_default(&o->enc_ctx->ch_layout, target_ch);
     o->enc_ctx->time_base = (AVRational){1, target_rate};
     o->enc_ctx->bit_rate = st->cfg.bitrate;
-
+#if LIBAVCODEC_VERSION_INT >= AV_VERSION_INT(61, 3, 100) // FFmpeg 7.0+
     const enum AVSampleFormat *supported_fmts = NULL;
     int n_fmts = 0;
     avcodec_get_supported_config(NULL, enc, AV_CODEC_CONFIG_SAMPLE_FORMAT, 0,
                                   (const void **)&supported_fmts, &n_fmts);
     enum AVSampleFormat chosen_fmt = (supported_fmts && n_fmts > 0) ? supported_fmts[0] : AV_SAMPLE_FMT_FLTP;
-    
+#else
+    const enum AVSampleFormat *supported_fmts = enc->sample_fmts;
+    enum AVSampleFormat chosen_fmt = (supported_fmts && supported_fmts[0] != AV_SAMPLE_FMT_NONE) ? supported_fmts[0] : AV_SAMPLE_FMT_FLTP;
+#endif
     o->enc_ctx->sample_fmt = chosen_fmt;
-    //o->enc_ctx->sample_fmt =  AV_SAMPLE_FMT_FLTP;
     o->enc_ctx->rc_max_rate = st->cfg.bitrate;
     o->enc_ctx->rc_min_rate = st->cfg.bitrate;
     o->enc_ctx->rc_buffer_size = st->cfg.bitrate; 
