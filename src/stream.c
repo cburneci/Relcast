@@ -815,9 +815,10 @@ static char* basename_no_ext(const char *path)
     return out;    
 }
 
-static rc_track_src_t *track_open_file(const char *path, int target_rate, int target_ch)
+static rc_track_src_t *track_open_file(rc_stream_t *st, const char *path, int target_rate, int target_ch)
 {
-    rc_track_src_t *t = track_alloc_common(NULL, target_rate, target_ch);
+    int rv;
+    rc_track_src_t *t = track_alloc_common(st, target_rate, target_ch);
     if (t == NULL) return NULL;
     if (path == NULL) return NULL;
     t->is_live = 0;
@@ -847,21 +848,27 @@ static rc_track_src_t *track_open_file(const char *path, int target_rate, int ta
     t->song_title = title;   
     //no need to html encode for now
     //html_encode(title, t->song_title, sizeof(t->song_title));
-    
-    if (avformat_open_input(&t->ifmt_ctx, path, NULL, NULL) < 0) {
+    rv = avformat_open_input(&t->ifmt_ctx, path, NULL, NULL);
+    if (rv < 0) {
+        rc_loge("DEBUG","avformat_find_stream_input(): %s", av_err2str(rv));
         track_close(t);
         return NULL;
     }
-    if (avformat_find_stream_info(t->ifmt_ctx, NULL) < 0) {
+    rv = avformat_find_stream_info(t->ifmt_ctx, NULL);
+    if (rv < 0) {
+        rc_loge("DEBUG","avformat_find_stream_info(): %s", av_err2str(rv));
         track_close(t);
         return NULL;
     }
     t->stream_idx = av_find_best_stream(t->ifmt_ctx, AVMEDIA_TYPE_AUDIO, -1, -1, NULL, 0);
     if (t->stream_idx < 0) {
         track_close(t);
+        rc_loge("DEBUG","av_find_best_stream(): %s", av_err2str(t->stream_idx));
         return NULL;
     }
-    if (track_setup_decoder(t) != 0) {
+    rv = track_setup_decoder(t);
+    if ( rv != 0) {
+        rc_loge("DEBUG","track_setup_decoder(): %s", av_err2str(t->stream_idx));
         track_close(t);
         return NULL;
     }
@@ -1495,7 +1502,7 @@ static rc_track_src_t *acquire_next_playlist_track(rc_stream_t *st, int target_r
             path = playlist_advance(st);
             if (path == NULL) break;
             
-            rc_track_src_t *t = track_open_file(path, target_rate, target_ch);
+            rc_track_src_t *t = track_open_file(st, path, target_rate, target_ch);
             if (t) { opened = 1; return t; }
 
             rc_loge(st->cfg.name, "playlist entry not found or unreadable, skipping: %s", path);
