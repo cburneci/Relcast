@@ -211,11 +211,11 @@ static int shoutcast_io_write(void *opaque, const uint8_t *buf, int buf_size)
 {
     rc_shoutcast_io_t *sio = (rc_shoutcast_io_t *)opaque;
     int total = 0;
-    {
+#ifdef DEBUG_SHOUTCAST
         static FILE *dbgf = NULL;
         if (!dbgf) dbgf = fopen("/tmp/relcast_sent_dump.bin", "wb");
         if (dbgf) { fwrite(buf, 1, buf_size, dbgf); fflush(dbgf); }
-    }
+#endif        
     while (total < buf_size) {
         ssize_t n = send(sio->fd, buf + total, buf_size - total, MSG_NOSIGNAL);
         if (n < 0) {
@@ -682,10 +682,12 @@ static void track_close(rc_track_src_t *t)
         if (t->is_input_opened)
         {
             avformat_close_input(&t->ifmt_ctx);
+            rc_logd("DEBUG", "Input closed");
         }
         else
         {
            if (t->ifmt_ctx) avformat_free_context(t->ifmt_ctx) ;
+           rc_logd("DEBUG", "Input was not opened. Freed context");
         }   
     }
     if (t->fifo) av_audio_fifo_free(t->fifo);
@@ -850,25 +852,26 @@ static rc_track_src_t *track_open_file(rc_stream_t *st, const char *path, int ta
     //html_encode(title, t->song_title, sizeof(t->song_title));
     rv = avformat_open_input(&t->ifmt_ctx, path, NULL, NULL);
     if (rv < 0) {
-        rc_loge("DEBUG","avformat_find_stream_input(): %s", av_err2str(rv));
+        rc_loge(st->cfg.name,"avformat_open_input(): %s", av_err2str(rv));
         track_close(t);
         return NULL;
     }
+    t->is_input_opened = 1;
     rv = avformat_find_stream_info(t->ifmt_ctx, NULL);
     if (rv < 0) {
-        rc_loge("DEBUG","avformat_find_stream_info(): %s", av_err2str(rv));
+        rc_loge(st->cfg.name,"avformat_find_stream_info(): %s", av_err2str(rv));
         track_close(t);
         return NULL;
     }
     t->stream_idx = av_find_best_stream(t->ifmt_ctx, AVMEDIA_TYPE_AUDIO, -1, -1, NULL, 0);
     if (t->stream_idx < 0) {
         track_close(t);
-        rc_loge("DEBUG","av_find_best_stream(): %s", av_err2str(t->stream_idx));
+        rc_loge(st->cfg.name,"av_find_best_stream(): %s", av_err2str(t->stream_idx));
         return NULL;
     }
     rv = track_setup_decoder(t);
     if ( rv != 0) {
-        rc_loge("DEBUG","track_setup_decoder(): %s", av_err2str(t->stream_idx));
+        rc_loge(st->cfg.name,"track_setup_decoder(): %s", av_err2str(t->stream_idx));
         track_close(t);
         return NULL;
     }
